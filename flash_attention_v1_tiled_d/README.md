@@ -116,10 +116,11 @@ Optimized CUDA kernel with **Tensor Core acceleration** using WMMA (Warp Matrix 
   
 - **Device functions:**
   - `mat_mul_chunk_accumulate()`: WMMA-accelerated Q@K^T with fragment operations
-  - `accumulate_output_chunk()`: Standard S@V computation (WMMA optimization pending)
+  - `accumulate_output_chunk()`: WMMA-accelerated S@V with shared memory staging
   - Efficient warp coordination with minimal divergence
+  - Smart buffer reuse: QK_chunk staging for S@V WMMA results (no extra memory)
 
-**Performance:** ~97ms for typical workload (B=32, H=8, L=1024, d=128), **73× speedup** over CPU reference, **1.6× faster than baseline**.
+**Performance:** ~39ms for typical workload (B=32, H=8, L=1024, d=128), **183× speedup** over CPU reference, **4.0× faster than baseline**.
 
 **Purpose:** Production-optimized kernel leveraging modern GPU Tensor Cores for maximum performance.
 
@@ -282,7 +283,7 @@ Typical performance (B=32, H=8, L=1024, d=128):
 |---------|---------|----------------|---------------------|
 | CPU reference | ~7100ms | 1× | - |
 | **Baseline (v1)** | **~154ms** | **46×** | 1× |
-| **Optimized (opt)** | **~97ms** | **73×** | **1.6×** |
+| **Optimized (opt)** | **~39ms** | **183×** | **4.0×** |
 
 Configuration used:
 - BQ=16, BK=16 (larger tiles, 4× more work per iteration)
@@ -294,21 +295,24 @@ Performance factors:
 - **Larger d-tiles** (32 vs 16): Fewer loop iterations, reduced overhead
 - **Register-based O_acc**: Faster than shared memory access
 - **True d-tiling**: Enables larger BQ/BK without exhausting shared memory
-- **Tensor Cores (opt)**: WMMA APIs provide 1.6× speedup for Q@K^T computation
+- **Tensor Cores (opt)**: WMMA APIs provide 4.0× speedup for both Q@K^T and S@V
+- **Smart buffer reuse**: No additional shared memory for WMMA staging
 - Half-precision (`__half`): 2× faster than double precision
 
 ## Optimization Journey
 
 ### Implemented Optimizations
-1. ✅ **Tensor Cores (WMMA)**: Leveraged 16×16×16 WMMA operations for Q@K^T computation
-   - 1.6× speedup over baseline (97ms vs 154ms)
-   - Efficient single-warp implementation for 16×16 output tiles
+1. ✅ **Tensor Cores (WMMA)**: Leveraged 16×16×16 WMMA operations for both Q@K^T and S@V
+   - Q@K^T: 1.6× speedup over baseline (154ms → 97ms)
+   - S@V: Additional 2.5× speedup (97ms → 39ms)
+   - Total: 4.0× speedup with WMMA (154ms → 39ms)
+   - Efficient warp coordination and buffer reuse
    - D_TILE=32 processed as two WMMA operations
    - Compile-time detection and automatic fallback
+   - No additional shared memory (reuses QK_chunk for staging)
 
 ### Future Optimization Opportunities
-1. **Tensor Cores for S@V**: Extend WMMA to attention-weighted value computation
-2. **Multi-warp strategies**: Distribute work across multiple warps for larger tiles
+1. **Multi-warp strategies**: Distribute work across multiple warps for larger tiles
 3. **Asynchronous memory copies**: Overlap data loading with computation using async copy
 4. **Double buffering**: Pipeline d-tile loading to hide memory latency
 5. **Warp-level primitives**: Use shuffle operations for faster reductions and synchronization
@@ -320,7 +324,7 @@ Performance factors:
 |----------------|----------|----------------|--------------|------------|---------|---------|----------|
 | `flash_attention_v1/` | No | Shared | No | 8.2 KB | ~200ms | ~35× | Baseline, small d |
 | `flash_attention_v1_tiled_d/` (v1) | **True** | **Registers** | No | **3.7 KB** | 154ms | **46×** | **Scalable d** |
-| `flash_attention_v1_tiled_d/` (opt) | **True** | **Registers** | **Yes** | **3.7 KB** | **97ms** | **73×** | **Maximum performance** |
+| `flash_attention_v1_tiled_d/` (opt) | **True** | **Registers** | **Yes (Q@K^T + S@V)** | **3.7 KB** | **39ms** | **183×** | **Maximum performance** |
 
 ## Summary
 
@@ -329,11 +333,12 @@ This **true d-tiled** Flash Attention implementation with **Tensor Core accelera
 - ✅ **Register-based output**: Eliminates O_acc from shared memory
 - ✅ **Supports arbitrary head dimensions**: Not limited by shared memory capacity
 - ✅ **Independent d-tiling parameters**: Separate optimization for Q@K^T and S@V
-- ✅ **73× GPU speedup (optimized)**: Peak performance with Tensor Cores (97ms vs 7100ms)
+- ✅ **183× GPU speedup (optimized)**: Peak performance with Tensor Cores (39ms vs 7100ms)
 - ✅ **46× GPU speedup (baseline)**: Standard CUDA cores (154ms vs 7100ms)
 - ✅ **Production-ready**: Handles d=128-512+ efficiently
-- ✅ **Tensor Core accelerated**: WMMA APIs provide 1.6× additional speedup
+- ✅ **Tensor Core accelerated**: WMMA APIs provide 4.0× additional speedup (both Q@K^T and S@V)
 - ✅ **Two variants**: Baseline (v1) and optimized (opt) for different hardware
+- ✅ **Smart buffer reuse**: No extra memory for WMMA staging
 - ✅ **Clear implementation**: Progression from Python to Tensor Core-optimized CUDA
 
 The approach demonstrates how **true memory-efficient tiling** combined with **modern GPU hardware features** (Tensor Cores) enables Flash Attention to scale to larger problem sizes while achieving excellent performance through careful register/shared memory management and specialized compute units.

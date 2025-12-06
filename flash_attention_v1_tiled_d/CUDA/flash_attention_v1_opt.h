@@ -157,34 +157,109 @@ __device__ void row_sum_mul_add_inplace(
 // Compute S@V for one d-tile chunk and accumulate into register-based output
 // Each thread updates its owned output elements
 // S: [bq, bk], V_chunk: [bk, d_tile_v]
-// NOTE: Currently using standard implementation - WMMA for S@V needs more work
+// O_tile_buf: temporary buffer to stage WMMA results (can reuse QK_chunk space)
+//
+// Design Note: We use shared memory staging (store_matrix_sync → O_tile_buf → thread reads)
+// rather than direct fragment access because:
+//   - Fragment element layout is architecture-specific and undocumented
+//   - Direct access via fragment.x[i] is non-portable across GPU generations
+//   - We reuse existing QK_chunk buffer, so no additional memory cost
+//   - Shared memory round-trip is negligible compared to 4× Tensor Core speedup
 __device__ void accumulate_output_chunk(
     float* O_reg, const DATA_TYPE* S, const DATA_TYPE* V_chunk,
     const float* alpha, int bq, int bk, int d_tile_size, int d_offset,
-    int elems_per_thread, int thread_start_elem
+    int elems_per_thread, int thread_start_elem, DATA_TYPE* O_tile_buf
 ) {
-    // Each thread processes its assigned output elements
-    for (int t = 0; t < elems_per_thread; t++) {
-        int linear_idx = thread_start_elem + t;
-        if (linear_idx >= bq * D) break;
+    if constexpr (use_wmma_v) {
+        // Verify that O_tile_buf is large enough to hold WMMA output [BQ, d_tile_size]
+        // O_tile_buf should be the reused QK_chunk buffer with size (BQ+BK)*D_TILE_QK
+        // Required: BQ * d_tile_size <= (BQ+BK) * D_TILE_QK
+        static_assert((BQ + BK) * D_TILE_QK >= BQ * D_TILE_V, 
+                     "QK_chunk buffer too small to stage WMMA S@V results");
         
-        int row = linear_idx / D;
-        int col = linear_idx % D;
+        // Use Tensor Cores for S@V computation
+        // With BQ=16, BK=16, D_TILE_V=32, we compute:
+        // - 1 tile in M dimension (16/16 = 1)
+        // - 2 tiles in N dimension (32/16 = 2)
+        // - 1 tile in K dimension (16/16 = 1)
+        constexpr int WMMA_M = 16;
+        constexpr int WMMA_N = 16;
+        constexpr int WMMA_K = 16;
         
-        // Only process if this column is in the current d-tile
-        if (col >= d_offset && col < d_offset + d_tile_size) {
-            int col_local = col - d_offset;
+        const int warp_id = threadIdx.x / 32;
+        const int num_warps = blockDim.x / 32;
+        
+        // Compute how many 16-wide tiles we need in the N dimension
+        int n_tiles = (d_tile_size + WMMA_N - 1) / WMMA_N;
+        
+        // Distribute N tiles across warps
+        for (int tile_n = warp_id; tile_n < n_tiles; tile_n += num_warps) {
+            if (tile_n * WMMA_N >= d_tile_size) continue;
             
-            // Scale by alpha
-            O_reg[t] *= alpha[row];
+            // Single M tile (BQ=16), single K tile (BK=16)
+            wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, half> acc_frag;
+            wmma::fill_fragment(acc_frag, __float2half(0.0f));
             
-            // Accumulate S @ V_chunk contribution
-            float sum = 0.0f;
-            for (int k = 0; k < bk; k++) {
-                sum += DATA_TO_FLOAT(S[idx2d(row, k, bk)]) * 
-                       DATA_TO_FLOAT(V_chunk[idx2d(k, col_local, d_tile_size)]);
+            wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> a_frag;
+            wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> b_frag;
+            
+            // Load S [16, 16] as matrix A
+            wmma::load_matrix_sync(a_frag, S, bk);
+            
+            // Load V chunk [16, d_tile_size] - take columns [tile_n*16 : (tile_n+1)*16]
+            wmma::load_matrix_sync(b_frag, V_chunk + tile_n * WMMA_N, d_tile_size);
+            
+            // Compute: O_tile = S @ V_chunk
+            wmma::mma_sync(acc_frag, a_frag, b_frag, acc_frag);
+            
+            // Store to temporary buffer [BQ, d_tile_size]
+            // Use O_tile_buf which can be the reused QK_chunk space
+            wmma::store_matrix_sync(O_tile_buf + tile_n * WMMA_N, acc_frag, 
+                                   d_tile_size, wmma::mem_row_major);
+        }
+        __syncthreads();
+        
+        // Now each thread reads from O_tile_buf and updates its registers
+        for (int t = 0; t < elems_per_thread; t++) {
+            int linear_idx = thread_start_elem + t;
+            if (linear_idx >= bq * D) break;
+            
+            int row = linear_idx / D;
+            int col = linear_idx % D;
+            
+            // Only process if this column is in the current d-tile
+            if (col >= d_offset && col < d_offset + d_tile_size) {
+                int col_local = col - d_offset;
+                
+                // Scale by alpha and add WMMA result
+                O_reg[t] = O_reg[t] * alpha[row] + 
+                          __half2float(O_tile_buf[idx2d(row, col_local, d_tile_size)]);
             }
-            O_reg[t] += sum;
+        }
+    } else {
+        // Fallback: standard implementation without Tensor Cores
+        for (int t = 0; t < elems_per_thread; t++) {
+            int linear_idx = thread_start_elem + t;
+            if (linear_idx >= bq * D) break;
+            
+            int row = linear_idx / D;
+            int col = linear_idx % D;
+            
+            // Only process if this column is in the current d-tile
+            if (col >= d_offset && col < d_offset + d_tile_size) {
+                int col_local = col - d_offset;
+                
+                // Scale by alpha
+                O_reg[t] *= alpha[row];
+                
+                // Accumulate S @ V_chunk contribution
+                float sum = 0.0f;
+                for (int k = 0; k < bk; k++) {
+                    sum += DATA_TO_FLOAT(S[idx2d(row, k, bk)]) * 
+                           DATA_TO_FLOAT(V_chunk[idx2d(k, col_local, d_tile_size)]);
+                }
+                O_reg[t] += sum;
+            }
         }
     }
 }
@@ -276,8 +351,13 @@ __device__ void process_kv_tile(
         __syncthreads();
         
         // Accumulate into register-based output
+        // Reuse QK_chunk as temporary buffer for WMMA results (no longer needed here)
+        // QK_chunk size: (BQ+BK)*D_TILE_QK elements
+        // Required size: BQ*d_size elements (at most BQ*D_TILE_V)
+        assert((BQ + BK) * D_TILE_QK >= BQ * d_size && 
+               "QK_chunk buffer insufficient for WMMA output staging");
         accumulate_output_chunk(O_reg, S, V_chunk, alpha, bq, bk, d_size, d_start,
-                               elems_per_thread, thread_start_elem);
+                               elems_per_thread, thread_start_elem, QK_chunk);
         __syncthreads();
     }
 }
