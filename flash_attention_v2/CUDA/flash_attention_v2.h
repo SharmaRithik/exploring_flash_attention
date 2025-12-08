@@ -44,7 +44,7 @@
 #endif
 
 #ifndef KV_TILES_PER_BLOCK
-#define KV_TILES_PER_BLOCK 4  // V2 parallelism parameter (adjust based on BK)
+#define KV_TILES_PER_BLOCK 64  // V2 parallelism parameter (higher = fewer blocks, less overhead)
 #endif
 
 #ifndef THREADS_PER_BLOCK
@@ -73,6 +73,56 @@
 // Helper function: 2D to 1D index conversion (row-major)
 __device__ __host__ inline int idx2d(int i, int j, int cols) {
     return i * cols + j;
+}
+
+// Compute partial Q@K^T for one d-tile chunk
+// Q_chunk: [bq, d_tile_qk], K_chunk: [bk, d_tile_qk]
+// Accumulates into S: [bq, bk]
+__device__ void mat_mul_qk_accumulate(
+    const DATA_TYPE* Q_chunk, const DATA_TYPE* K_chunk, DATA_TYPE* S,
+    int bq, int bk, int d_tile_size
+) {
+    for (int idx = threadIdx.x; idx < bq * bk; idx += blockDim.x) {
+        int i = idx / bk;
+        int j = idx % bk;
+        float sum = 0.0f;
+        for (int k = 0; k < d_tile_size; k++) {
+            sum += DATA_TO_FLOAT(Q_chunk[idx2d(i, k, d_tile_size)]) *
+                   DATA_TO_FLOAT(K_chunk[idx2d(j, k, d_tile_size)]);
+        }
+        S[idx] = FLOAT_TO_DATA(DATA_TO_FLOAT(S[idx]) + sum);
+    }
+    __syncthreads();
+}
+
+// Compute S@V for one d-tile chunk and accumulate into register-based output
+// Each thread updates its owned output elements
+// S: [bq, bk], V_chunk: [bk, d_tile_v]
+__device__ void accumulate_output_sv(
+    float* O_reg, const DATA_TYPE* S, const DATA_TYPE* V_chunk,
+    int bq, int bk, int d, int d_tile_size, int d_offset,
+    int elems_per_thread, int thread_start_elem
+) {
+    for (int t = 0; t < elems_per_thread; t++) {
+        int linear_idx = thread_start_elem + t;
+        if (linear_idx >= bq * d) break;
+        
+        int row = linear_idx / d;
+        int col = linear_idx % d;
+        
+        // Only process if this column is in the current d-tile
+        if (col >= d_offset && col < d_offset + d_tile_size) {
+            int col_local = col - d_offset;
+            
+            // Accumulate S @ V_chunk contribution
+            float sum = 0.0f;
+            for (int k = 0; k < bk; k++) {
+                sum += DATA_TO_FLOAT(S[idx2d(row, k, bk)]) * 
+                       DATA_TO_FLOAT(V_chunk[idx2d(k, col_local, d_tile_size)]);
+            }
+            O_reg[t] += sum;
+        }
+    }
 }
 
 // D-tiled process_kv_tile with register-based O_acc (like V1)
@@ -116,18 +166,8 @@ __device__ void process_kv_tile_dtiled(
         }
         __syncthreads();
         
-        // Accumulate Q_chunk @ K_chunk^T into S
-        for (int idx = threadIdx.x; idx < bq * bk; idx += blockDim.x) {
-            int i = idx / bk;
-            int j = idx % bk;
-            float sum = 0.0f;
-            for (int k = 0; k < d_size; k++) {
-                sum += DATA_TO_FLOAT(QK_chunk[idx2d(i, k, d_tile_qk)]) *
-                       DATA_TO_FLOAT(K_chunk[idx2d(j, k, d_tile_qk)]);
-            }
-            S[idx] = FLOAT_TO_DATA(DATA_TO_FLOAT(S[idx]) + sum);
-        }
-        __syncthreads();
+        // Accumulate partial Q@K^T
+        mat_mul_qk_accumulate(QK_chunk, K_chunk, S, bq, bk, d_size);
     }
     
     // Scale by 1/sqrt(d)
@@ -192,27 +232,9 @@ __device__ void process_kv_tile_dtiled(
         }
         __syncthreads();
         
-        // Each thread updates its owned O_reg elements
-        for (int t = 0; t < elems_per_thread; t++) {
-            int linear_idx = thread_start_elem + t;
-            if (linear_idx >= bq * d) break;
-            
-            int row = linear_idx / d;
-            int col = linear_idx % d;
-            
-            // Only process if this column is in the current d-tile
-            if (col >= d_start && col < d_end) {
-                int col_local = col - d_start;
-                
-                // Accumulate S @ V_chunk contribution
-                float sum = 0.0f;
-                for (int k = 0; k < bk; k++) {
-                    sum += DATA_TO_FLOAT(S[idx2d(row, k, bk)]) * 
-                           DATA_TO_FLOAT(V_chunk[idx2d(k, col_local, d_tile_v)]);
-                }
-                O_reg[t] += sum;
-            }
-        }
+        // Accumulate into register-based output
+        accumulate_output_sv(O_reg, S, V_chunk, bq, bk, d, d_size, d_start,
+                            elems_per_thread, thread_start_elem);
         __syncthreads();
     }
 }
